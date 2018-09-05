@@ -1063,10 +1063,8 @@ static int p9221_set_property(struct power_supply *psy,
 			break;
 		}
 
-		if (!charger->dc_icl_votable) {
-			ret = -EAGAIN;
-			break;
-		}
+		if (!charger->dc_icl_votable)
+			return -EAGAIN;
 
 		ret = vote(charger->dc_icl_votable, P9221_USER_VOTER, true,
 			   val->intval);
