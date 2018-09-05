@@ -454,6 +454,20 @@ static int squashfs_readpage_fragment(struct page *page, int expected)
 
 static int squashfs_readpage_sparse(struct page *page, int expected)
 {
+	if (!page) {
+		page = lru_to_page(readahead_pages);
+		list_del(&page->lru);
+		if (add_to_page_cache_lru(page, mapping, page->index,
+			mapping_gfp_constraint(mapping, GFP_KERNEL))) {
+			put_page(page);
+			return 0;
+		}
+	}
+	return squashfs_readpage_fragment(page);
+}
+
+static int squashfs_readpage_sparse(struct page *page, int index, int file_end)
+{
 	squashfs_copy_cache(page, NULL, expected, 0);
 	return 0;
 }
