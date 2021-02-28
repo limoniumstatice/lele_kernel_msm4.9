@@ -6,6 +6,7 @@
 #define __LINUX_BLK_TYPES_H
 
 #include <linux/types.h>
+#include <linux/ktime.h>
 #include <linux/bvec.h>
 
 struct bio_set;
@@ -95,6 +96,8 @@ struct bio {
 
 	struct bio_set		*bi_pool;
 
+	unsigned long bi_alloc_ts;
+
 	/*
 	 * We can inline a number of vecs at the end of the bio, to avoid
 	 * double allocations for a small number of bio_vecs. This member
@@ -108,14 +111,8 @@ struct bio {
 #define bio_op(bio)	((bio)->bi_opf >> BIO_OP_SHIFT)
 
 #define bio_set_op_attrs(bio, op, op_flags) do {			\
-	if (__builtin_constant_p(op))					\
-		BUILD_BUG_ON((op) + 0U >= (1U << REQ_OP_BITS));		\
-	else								\
-		WARN_ON_ONCE((op) + 0U >= (1U << REQ_OP_BITS));		\
-	if (__builtin_constant_p(op_flags))				\
-		BUILD_BUG_ON((op_flags) + 0U >= (1U << BIO_OP_SHIFT));	\
-	else								\
-		WARN_ON_ONCE((op_flags) + 0U >= (1U << BIO_OP_SHIFT));	\
+	WARN_ON_ONCE((op) + 0U >= (1U << REQ_OP_BITS));			\
+	WARN_ON_ONCE((op_flags) + 0U >= (1U << BIO_OP_SHIFT));		\
 	(bio)->bi_opf = bio_flags(bio);					\
 	(bio)->bi_opf |= (((op) + 0U) << BIO_OP_SHIFT);			\
 	(bio)->bi_opf |= (op_flags);					\

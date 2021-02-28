@@ -1,4 +1,4 @@
-/* Copyright (c) 2008-2019, The Linux Foundation. All rights reserved.
+/* Copyright (c) 2008-2020, The Linux Foundation. All rights reserved.
  *
  * This program is free software; you can redistribute it and/or modify
  * it under the terms of the GNU General Public License version 2 and
@@ -272,7 +272,7 @@ static void kgsl_destroy_ion(struct kgsl_dma_buf_meta *meta)
 {
 	if (meta != NULL) {
 		dma_buf_unmap_attachment(meta->attach, meta->table,
-			DMA_FROM_DEVICE);
+			DMA_BIDIRECTIONAL);
 		dma_buf_detach(meta->dmabuf, meta->attach);
 		dma_buf_put(meta->dmabuf);
 		kfree(meta);
@@ -514,6 +514,21 @@ static int _kgsl_get_context_id(struct kgsl_device *device)
 	return id;
 }
 
+void kgsl_dump_active_contexts(struct kgsl_device *device)
+{
+	struct kgsl_context *tmp_context;
+	int tmp_id;
+
+	read_lock(&device->context_lock);
+	idr_for_each_entry (&device->context_idr, tmp_context, tmp_id) {
+		KGSL_DRV_ERR(device, "process %s pid %d created %d contexts",
+				tmp_context->proc_priv->comm,
+				tmp_context->proc_priv->pid,
+				tmp_context->proc_priv->ctxt_count);
+	}
+	read_unlock(&device->context_lock);
+}
+
 /**
  * kgsl_context_init() - helper to initialize kgsl_context members
  * @dev_priv: the owner of the context
@@ -562,12 +577,14 @@ int kgsl_context_init(struct kgsl_device_private *dev_priv,
 		flush_workqueue(device->events_wq);
 		id = _kgsl_get_context_id(device);
 	}
-
 	if (id < 0) {
-		if (id == -ENOSPC)
-			KGSL_DRV_INFO(device,
+		if (id == -ENOSPC) {
+			KGSL_DRV_ERR(
+				device,
 				"cannot have more than %zu contexts due to memstore limitation\n",
 				KGSL_MEMSTORE_MAX);
+			kgsl_dump_active_contexts(device);
+		}
 		atomic_dec(&proc_priv->ctxt_count);
 		return id;
 	}
@@ -2456,7 +2473,7 @@ long kgsl_ioctl_gpuobj_import(struct kgsl_device_private *dev_priv,
 	return 0;
 
 unmap:
-	if (param->type == KGSL_USER_MEM_TYPE_DMABUF) {
+	if (kgsl_memdesc_usermem_type(&entry->memdesc) == KGSL_MEM_ENTRY_ION) {
 		kgsl_destroy_ion(entry->priv_data);
 		entry->memdesc.sgt = NULL;
 	}
@@ -2561,7 +2578,7 @@ static int kgsl_setup_dma_buf(struct kgsl_device *device,
 	entry->memdesc.flags &= ~((uint64_t) KGSL_MEMFLAGS_USE_CPU_MAP);
 	entry->memdesc.flags |= (uint64_t)KGSL_MEMFLAGS_USERMEM_ION;
 
-	sg_table = dma_buf_map_attachment(attach, DMA_TO_DEVICE);
+	sg_table = dma_buf_map_attachment(attach, DMA_BIDIRECTIONAL);
 
 	if (IS_ERR_OR_NULL(sg_table)) {
 		ret = PTR_ERR(sg_table);
@@ -2774,7 +2791,7 @@ long kgsl_ioctl_map_user_mem(struct kgsl_device_private *dev_priv,
 	return result;
 
 error_attach:
-	switch (memtype) {
+	switch (kgsl_memdesc_usermem_type(&entry->memdesc)) {
 	case KGSL_MEM_ENTRY_ION:
 		kgsl_destroy_ion(entry->priv_data);
 		entry->memdesc.sgt = NULL;
@@ -4134,6 +4151,8 @@ kgsl_mmap_memstore(struct kgsl_device *device, struct vm_area_struct *vma)
 
 	if (vma->vm_flags & VM_WRITE)
 		return -EPERM;
+
+	vma->vm_flags &= ~VM_MAYWRITE;
 
 	if (memdesc->size  !=  vma_size) {
 		KGSL_MEM_ERR(device, "memstore bad size: %d should be %llu\n",

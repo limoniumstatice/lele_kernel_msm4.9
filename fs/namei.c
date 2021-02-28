@@ -1086,7 +1086,7 @@ const char *get_link(struct nameidata *nd)
 		return ERR_PTR(error);
 
 	nd->last_type = LAST_BIND;
-	res = inode->i_link;
+	res = READ_ONCE(inode->i_link);
 	if (!res) {
 		const char * (*get)(struct dentry *, struct inode *,
 				struct delayed_call *);
@@ -1385,7 +1385,7 @@ static int follow_dotdot_rcu(struct nameidata *nd)
 			nd->path.dentry = parent;
 			nd->seq = seq;
 			if (unlikely(!path_connected(&nd->path)))
-				return -ENOENT;
+				return -ECHILD;
 			break;
 		} else {
 			struct mount *mnt = real_mount(nd->path.mnt);
@@ -4797,8 +4797,10 @@ int generic_readlink(struct dentry *dentry, char __user *buffer, int buflen)
 {
 	DEFINE_DELAYED_CALL(done);
 	struct inode *inode = d_inode(dentry);
-	const char *link = inode->i_link;
+	const char *link;
 	int res;
+
+	link = READ_ONCE(inode->i_link);
 
 	if (!link) {
 		link = inode->i_op->get_link(dentry, inode, &done);

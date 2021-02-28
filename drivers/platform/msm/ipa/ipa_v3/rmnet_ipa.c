@@ -1,4 +1,4 @@
-/* Copyright (c) 2014-2018, The Linux Foundation. All rights reserved.
+/* Copyright (c) 2014-2018, 2020, The Linux Foundation. All rights reserved.
  *
  * This program is free software; you can redistribute it and/or modify
  * it under the terms of the GNU General Public License version 2 and
@@ -728,7 +728,8 @@ static int ipa3_wwan_add_ul_flt_rule_to_ipa(void)
 		retval = -EFAULT;
 	}
 
-	req->install_status = QMI_RESULT_SUCCESS_V01;
+	req->install_status = (enum ipa_qmi_result_type_v01)
+							QMI_RESULT_SUCCESS_V01;
 	req->rule_id_valid = 1;
 	req->rule_id_len = rmnet_ipa3_ctx->num_q6_rules;
 	for (i = 0; i < rmnet_ipa3_ctx->num_q6_rules; i++) {
@@ -1838,7 +1839,7 @@ static void ipa3_wwan_setup(struct net_device *dev)
 	dev->flags &= ~(IFF_BROADCAST | IFF_MULTICAST);
 	dev->needed_headroom = HEADROOM_FOR_QMAP;
 	dev->needed_tailroom = TAILROOM;
-	dev->watchdog_timeo = 1000;
+	dev->watchdog_timeo = 5000;
 }
 
 /* IPA_RM related functions start*/
@@ -3916,6 +3917,15 @@ int rmnet_ipa3_send_lan_client_msg(
 		IPAWANERR("Can't allocate memory for tether_info\n");
 		return -ENOMEM;
 	}
+
+	if (data->client_event != IPA_PER_CLIENT_STATS_CONNECT_EVENT &&
+		data->client_event != IPA_PER_CLIENT_STATS_DISCONNECT_EVENT) {
+		IPAWANERR("Wrong event given. Event:- %d\n",
+			data->client_event);
+		kfree(lan_client);
+		return -EINVAL;
+	}
+	data->lan_client.lanIface[IPA_RESOURCE_NAME_MAX-1] = '\0';
 	memset(&msg_meta, 0, sizeof(struct ipa_msg_meta));
 	memcpy(lan_client, &data->lan_client,
 		sizeof(struct ipa_lan_client_msg));

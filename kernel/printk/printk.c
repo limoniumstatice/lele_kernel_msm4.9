@@ -2097,6 +2097,9 @@ static int __init console_setup(char *str)
 	char *s, *options, *brl_options = NULL;
 	int idx;
 
+	if (str[0] == 0)
+		return 1;
+
 	if (_braille_console_setup(&str, &brl_options))
 		return 1;
 
@@ -2162,6 +2165,11 @@ module_param_named(console_suspend, console_suspend_enabled,
 		bool, S_IRUGO | S_IWUSR);
 MODULE_PARM_DESC(console_suspend, "suspend console during suspend"
 	" and hibernate operations");
+
+int is_console_suspended(void)
+{
+	return console_suspended;
+}
 
 /**
  * suspend_console - suspend the console subsystem

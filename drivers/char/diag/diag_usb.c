@@ -1,4 +1,4 @@
-/* Copyright (c) 2014-2016, 2018 The Linux Foundation. All rights reserved.
+/* Copyright (c) 2014-2016, 2018, 2020, The Linux Foundation. All rights reserved.
  *
  * This program is free software; you can redistribute it and/or modify
  * it under the terms of the GNU General Public License version 2 and
@@ -325,8 +325,8 @@ static void diag_usb_write_done(struct diag_usb_info *ch,
 		DIAG_LOG(DIAG_DEBUG_MUX, "partial write_done ref %d\n",
 			 atomic_read(&entry->ref_count));
 		diag_ws_on_copy_complete(DIAG_WS_MUX);
-		spin_unlock_irqrestore(&ch->write_lock, flags);
 		diagmem_free(driver, req, ch->mempool);
+		spin_unlock_irqrestore(&ch->write_lock, flags);
 		return;
 	}
 	DIAG_LOG(DIAG_DEBUG_MUX, "full write_done, ctxt: %d\n",
@@ -344,8 +344,8 @@ static void diag_usb_write_done(struct diag_usb_info *ch,
 	buf = NULL;
 	len = 0;
 	ctxt = 0;
-	spin_unlock_irqrestore(&ch->write_lock, flags);
 	diagmem_free(driver, req, ch->mempool);
+	spin_unlock_irqrestore(&ch->write_lock, flags);
 }
 
 static void diag_usb_notifier(void *priv, unsigned int event,
@@ -636,8 +636,8 @@ int diag_usb_register(int id, int ctxt, struct diag_mux_ops *ops)
 	INIT_WORK(&(ch->read_done_work), usb_read_done_work_fn);
 	INIT_WORK(&(ch->connect_work), usb_connect_work_fn);
 	INIT_WORK(&(ch->disconnect_work), usb_disconnect_work_fn);
-	strlcpy(wq_name, "DIAG_USB_", DIAG_USB_STRING_SZ);
-	strlcat(wq_name, ch->name, sizeof(ch->name));
+	strlcpy(wq_name, "DIAG_USB_", sizeof(wq_name));
+	strlcat(wq_name, ch->name, sizeof(wq_name));
 	ch->usb_wq = create_singlethread_workqueue(wq_name);
 	if (!ch->usb_wq)
 		goto err;

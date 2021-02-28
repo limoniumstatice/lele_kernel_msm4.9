@@ -14,7 +14,6 @@
 #include <linux/tty.h>
 #include <linux/iocontext.h>
 #include <linux/key.h>
-#include <linux/security.h>
 #include <linux/cpu.h>
 #include <linux/acct.h>
 #include <linux/tsacct_kern.h>
@@ -746,8 +745,12 @@ void __noreturn do_exit(long code)
 	int group_dead;
 	TASKS_RCU(int tasks_rcu_i);
 
-	profile_task_exit(tsk);
-	kcov_task_exit(tsk);
+	/*
+	 * We can get here from a kernel oops, sometimes with preemption off.
+	 * Start by checking for critical errors.
+	 * Then fix up important state like USER_DS and preemption.
+	 * Then do everything else.
+	 */
 
 	WARN_ON(blk_needs_flush_plug(tsk));
 
@@ -764,6 +767,16 @@ void __noreturn do_exit(long code)
 	 * kernel address.
 	 */
 	set_fs(USER_DS);
+
+	if (unlikely(in_atomic())) {
+		pr_info("note: %s[%d] exited with preempt_count %d\n",
+			current->comm, task_pid_nr(current),
+			preempt_count());
+		preempt_count_set(PREEMPT_ENABLED);
+	}
+
+	profile_task_exit(tsk);
+	kcov_task_exit(tsk);
 
 	ptrace_event(PTRACE_EVENT_EXIT, code);
 
@@ -808,13 +821,6 @@ void __noreturn do_exit(long code)
 	 * mm_release() -> exit_pi_state_list().
 	 */
 	raw_spin_unlock_wait(&tsk->pi_lock);
-
-	if (unlikely(in_atomic())) {
-		pr_info("note: %s[%d] exited with preempt_count %d\n",
-			current->comm, task_pid_nr(current),
-			preempt_count());
-		preempt_count_set(PREEMPT_ENABLED);
-	}
 
 	/* sync mm's RSS info before statistics gathering */
 	if (tsk->mm)
@@ -1372,7 +1378,7 @@ static int wait_task_continued(struct wait_opts *wo, struct task_struct *p)
  * Returns nonzero for a final return, when we have unlocked tasklist_lock.
  * Returns zero if the search for a child should continue;
  * then ->notask_error is 0 if @p is an eligible child,
- * or another error from security_task_wait(), or still -ECHILD.
+ * or still -ECHILD.
  */
 static int wait_consider_task(struct wait_opts *wo, int ptrace,
 				struct task_struct *p)
@@ -1391,20 +1397,6 @@ static int wait_consider_task(struct wait_opts *wo, int ptrace,
 	ret = eligible_child(wo, ptrace, p);
 	if (!ret)
 		return ret;
-
-	ret = security_task_wait(p);
-	if (unlikely(ret < 0)) {
-		/*
-		 * If we have not yet seen any eligible child,
-		 * then let this error code replace -ECHILD.
-		 * A permission error will give the user a clue
-		 * to look for security policy problems, rather
-		 * than for mysterious wait bugs.
-		 */
-		if (wo->notask_error)
-			wo->notask_error = ret;
-		return 0;
-	}
 
 	if (unlikely(exit_state == EXIT_TRACE)) {
 		/*
@@ -1498,7 +1490,7 @@ static int wait_consider_task(struct wait_opts *wo, int ptrace,
  * Returns nonzero for a final return, when we have unlocked tasklist_lock.
  * Returns zero if the search for a child should continue; then
  * ->notask_error is 0 if there were any eligible children,
- * or another error from security_task_wait(), or still -ECHILD.
+ * or still -ECHILD.
  */
 static int do_wait_thread(struct wait_opts *wo, struct task_struct *tsk)
 {

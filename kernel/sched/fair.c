@@ -2624,7 +2624,7 @@ void task_tick_numa(struct rq *rq, struct task_struct *curr)
 	/*
 	 * We don't care about NUMA placement if we don't have memory.
 	 */
-	if (!curr->mm || (curr->flags & PF_EXITING) || work->next != work)
+	if ((curr->flags & (PF_EXITING | PF_KTHREAD)) || work->next != work)
 		return;
 
 	/*
@@ -8590,7 +8590,15 @@ redo:
 		if (!can_migrate_task(p, env))
 			goto next;
 
-		load = task_h_load(p);
+		/*
+		 * Depending of the number of CPUs and tasks and the
+		 * cgroup hierarchy, task_h_load() can return a null
+		 * value. Make sure that env->imbalance decreases
+		 * otherwise detach_tasks() will stop only after
+		 * detaching up to loop_max tasks.
+		 */
+		load = max_t(unsigned long, task_h_load(p), 1);
+
 
 		if (sched_feat(LB_MIN) && load < 16 && !env->sd->nr_balance_failed)
 			goto next;
@@ -8917,12 +8925,16 @@ static void update_cpu_capacity(struct sched_domain *sd, int cpu)
 	unsigned long max_capacity;
 	int max_cap_cpu;
 	unsigned long flags;
+	bool update = false;
 
 	capacity *= arch_scale_max_freq_capacity(sd, cpu);
 	capacity >>= SCHED_CAPACITY_SHIFT;
 
 	capacity = min(capacity, thermal_cap(cpu));
-	cpu_rq(cpu)->cpu_capacity_orig = capacity;
+	if (cpu_rq(cpu)->cpu_capacity_orig != capacity) {
+		cpu_rq(cpu)->cpu_capacity_orig = capacity;
+		update = true;
+	}
 
 	mcc = &cpu_rq(cpu)->rd->max_cpu_capacity;
 
@@ -8951,7 +8963,13 @@ skip_unlock: __attribute__ ((unused));
 	if (!capacity)
 		capacity = 1;
 
-	cpu_rq(cpu)->cpu_capacity = capacity;
+	if (cpu_rq(cpu)->cpu_capacity != capacity) {
+		cpu_rq(cpu)->cpu_capacity = capacity;
+		update = true;
+	}
+	if (update)
+		trace_sched_capacity_update(cpu);
+
 	if (!sd->child) {
 		sdg->sgc->capacity = capacity;
 		sdg->sgc->max_capacity = capacity;

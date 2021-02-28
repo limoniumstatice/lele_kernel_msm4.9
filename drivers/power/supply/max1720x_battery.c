@@ -54,6 +54,8 @@
 #define BATTERY_MAX_CYCLE_BAND		20
 
 #define MAX17201_FIXUP_UPDATE_DELAY_MS	10
+#define DEFAULT_HIGH_TEMP_UPDATE_THRESHOLD     550
+#define HIGH_TEMP_UPDATE_CHECK	30000
 
 enum max1720x_register {
 	/* ModelGauge m5 Register */
@@ -325,6 +327,7 @@ struct max1720x_chip {
 	struct regmap *regmap;
 	struct power_supply *psy;
 	struct delayed_work init_work;
+	struct delayed_work temp_notify_work;
 	struct work_struct cycle_count_work;
 	struct i2c_client *primary;
 	struct i2c_client *secondary;
@@ -344,6 +347,7 @@ struct max1720x_chip {
 	u16 RSense;
 	u16 RConfig;
 	int cycle_count;
+	int cycle_count_offset;
 	bool init_complete;
 	bool resume_complete;
 	u16 health_status;
@@ -370,6 +374,19 @@ struct max1720x_chip {
 	int cycle_stable;
 	int ini_rcomp0;
 	int ini_tempco;
+
+	/* record temp for update condition */
+	u32 batt_update_high_temp_threshold;
+	int batt_temp;
+	bool monitor_batt_temp;
+
+	/*
+	 * Thermal test:
+	 * fake_temp=0 means no fake
+	 * fake_temp>0 means fake the battery temp
+	 */
+	u16 fake_temp;
+	int batt_health;
 };
 
 static inline int max1720x_regmap_read(struct regmap *map,
@@ -706,6 +723,50 @@ static enum power_supply_property max1720x_battery_props[] = {
 	POWER_SUPPLY_PROP_TECHNOLOGY,
 	POWER_SUPPLY_PROP_SERIAL_NUMBER,
 };
+
+static int max1720x_get_battery_temperature(struct max1720x_chip *chip,
+					     int *temp)
+{
+	int err;
+	u16 data = 0;
+	struct regmap *map = chip->regmap;
+
+	if (chip->fake_temp) {
+		*temp = chip->fake_temp;
+	} else {
+		err = REGMAP_READ(map, MAX1720X_TEMP, &data);
+		if (err) {
+			dev_warn(chip->dev, "failed to read temp(%d)\n", err);
+			return err;
+		}
+		*temp = reg_to_deci_deg_cel(data);
+	}
+
+	return 0;
+}
+
+static void max1720x_temp_notify_work(struct work_struct *work)
+{
+	int batt_temp, ret;
+	struct max1720x_chip *chip = container_of(work, struct max1720x_chip,
+						  temp_notify_work.work);
+
+	ret = max1720x_get_battery_temperature(chip, &batt_temp);
+	if (ret < 0)
+		return;
+
+	if (batt_temp > chip->batt_update_high_temp_threshold) {
+		if (batt_temp != chip->batt_temp) {
+			chip->batt_temp = batt_temp;
+			if (chip->psy)
+				power_supply_changed(chip->psy);
+		}
+		schedule_delayed_work(&chip->temp_notify_work,
+				msecs_to_jiffies(HIGH_TEMP_UPDATE_CHECK));
+	} else {
+		chip->monitor_batt_temp = false;
+	}
+}
 
 static void max1720x_cycle_count_work(struct work_struct *work)
 {
@@ -1073,21 +1134,28 @@ static void max1720x_handle_update_nconvgcfg(struct max1720x_chip *chip,
 #define MAX17201_HIST_CYCLE_COUNT_OFFSET	0x4
 #define MAX17201_HIST_TIME_OFFSET		0xf
 
-static int max1720x_get_cycle_count_offset(const struct max1720x_chip *chip)
+static int max1720x_get_cycle_count_offset(struct max1720x_chip *chip)
 {
 	int offset = 0, i, history_count;
 	struct max1720x_history hi;
 
+	mutex_lock(&chip->history_lock);
 	history_count = max1720x_history_read(&hi, chip);
+	if (history_count < 0) {
+		mutex_unlock(&chip->history_lock);
+		return 0;
+	}
+
 	for (i = 0; i < history_count; i++) {
 		u16 *entry = &hi.history[i * MAX1720X_HISTORY_PAGE_SIZE];
 
 		if (entry[MAX17201_HIST_CYCLE_COUNT_OFFSET] == 0 &&
 		    entry[MAX17201_HIST_TIME_OFFSET] != 0) {
-			offset = MAXIM_CYCLE_COUNT_RESET;
+			offset += MAXIM_CYCLE_COUNT_RESET;
 			break;
 		}
 	}
+	mutex_unlock(&chip->history_lock);
 
 	dev_dbg(chip->dev, "history_count=%d page_size=%d i=%d offset=%d\n",
 		history_count, MAX1720X_HISTORY_PAGE_SIZE, i, offset);
@@ -1106,11 +1174,14 @@ static int max1720x_get_cycle_count(struct max1720x_chip *chip)
 		return err;
 
 	cycle_count = reg_to_cycles(temp);
-	if (chip->cycle_count == -1 || cycle_count < chip->cycle_count)
-		cycle_count += max1720x_get_cycle_count_offset(chip);
+	if ((chip->cycle_count == -1) ||
+	    ((cycle_count + chip->cycle_count_offset) < chip->cycle_count))
+		chip->cycle_count_offset =
+			max1720x_get_cycle_count_offset(chip);
 
-	chip->cycle_count = cycle_count;
-	return cycle_count;
+	chip->cycle_count = cycle_count + chip->cycle_count_offset;
+
+	return chip->cycle_count;
 }
 
 
@@ -1137,7 +1208,10 @@ static int max1720x_get_property(struct power_supply *psy,
 			return val->intval;
 		break;
 	case POWER_SUPPLY_PROP_HEALTH:
-		val->intval = max1720x_get_battery_health(chip);
+		if (chip->batt_health != POWER_SUPPLY_HEALTH_UNKNOWN)
+			val->intval = chip->batt_health;
+		else
+			val->intval = max1720x_get_battery_health(chip);
 		break;
 	case POWER_SUPPLY_PROP_CAPACITY:
 		val->intval = max1720x_get_battery_soc(chip);
@@ -1199,9 +1273,14 @@ static int max1720x_get_property(struct power_supply *psy,
 		val->intval = reg_to_resistance_micro_ohms(data, chip->RSense);
 		break;
 	case POWER_SUPPLY_PROP_TEMP:
-		REGMAP_READ(map, MAX1720X_TEMP, &data);
-		val->intval = reg_to_deci_deg_cel(data);
+		err = max1720x_get_battery_temperature(chip, &val->intval);
 		max1720x_handle_update_nconvgcfg(chip, val->intval);
+		if ((!chip->monitor_batt_temp) &&
+			(val->intval > chip->batt_update_high_temp_threshold)) {
+			chip->monitor_batt_temp = true;
+			schedule_delayed_work(&chip->temp_notify_work,
+				msecs_to_jiffies(HIGH_TEMP_UPDATE_CHECK));
+		}
 		break;
 	case POWER_SUPPLY_PROP_TIME_TO_EMPTY_AVG:
 		err = REGMAP_READ(map, MAX1720X_TTE, &data);
@@ -1592,6 +1671,9 @@ static int max1720x_set_property(struct power_supply *psy,
 	case POWER_SUPPLY_PROP_CAPACITY:
 		rc = max1720x_set_battery_soc(chip, val);
 		break;
+	case POWER_SUPPLY_PROP_HEALTH:
+		chip->batt_health = val->intval;
+		break;
 	default:
 		return -EINVAL;
 	}
@@ -1605,6 +1687,7 @@ static int max1720x_property_is_writeable(struct power_supply *psy,
 	switch (psp) {
 	case POWER_SUPPLY_PROP_CAPACITY:
 	case POWER_SUPPLY_PROP_BATT_CE_CTRL:
+	case POWER_SUPPLY_PROP_HEALTH:
 		return 1;
 	default:
 		break;
@@ -2082,6 +2165,25 @@ static int set_irq_none_cnt(void *data, u64 val)
 
 DEFINE_SIMPLE_ATTRIBUTE(irq_none_cnt_fops, get_irq_none_cnt,
 	set_irq_none_cnt, "%llu\n");
+
+static int get_fake_temp(void *data, u64 *val)
+{
+	struct max1720x_chip *chip = data;
+
+	*val = chip->fake_temp;
+	return 0;
+}
+
+static int set_fake_temp(void *data, u64 val)
+{
+	struct max1720x_chip *chip = data;
+
+	chip->fake_temp = val;
+	return 0;
+}
+
+DEFINE_SIMPLE_ATTRIBUTE(fake_temp_fops, get_fake_temp,
+	set_fake_temp, "%llu\n");
 #endif
 
 static int init_debugfs(struct max1720x_chip *chip)
@@ -2090,9 +2192,12 @@ static int init_debugfs(struct max1720x_chip *chip)
 	struct dentry *de;
 
 	de = debugfs_create_dir("max1720x", 0);
-	if (de)
+	if (de) {
 		debugfs_create_file("irq_none_cnt", 0644, de,
 				   chip, &irq_none_cnt_fops);
+		debugfs_create_file("fake_temp", 0600, de,
+				   chip, &fake_temp_fops);
+	}
 #endif
 	return 0;
 }
@@ -2544,6 +2649,7 @@ static void max1720x_init_work(struct work_struct *work)
 
 	(void)max1720x_init_history(chip);
 	chip->cycle_count = -1;
+	chip->fake_temp = 0;
 
 	if (chip->psy)
 		power_supply_changed(chip->psy);
@@ -2557,6 +2663,7 @@ static int max1720x_probe(struct i2c_client *client,
 	struct power_supply_config psy_cfg = { };
 
 	int ret = 0;
+	u32 data32;
 
 	chip = devm_kzalloc(dev, sizeof(*chip), GFP_KERNEL);
 	if (!chip)
@@ -2604,6 +2711,14 @@ static int max1720x_probe(struct i2c_client *client,
 	if (of_property_read_bool(dev->of_node, "maxim,psy-type-unknown"))
 		max1720x_psy_desc.type = POWER_SUPPLY_TYPE_UNKNOWN;
 
+	ret = read_chip_property_u32(chip, "maxim,update-high-temp-threshold",
+					&data32);
+	if (ret < 0)
+		chip->batt_update_high_temp_threshold =
+					DEFAULT_HIGH_TEMP_UPDATE_THRESHOLD;
+	else
+		chip->batt_update_high_temp_threshold = data32;
+
 	psy_cfg.drv_data = chip;
 	chip->psy = devm_power_supply_register(dev,
 					       &max1720x_psy_desc, &psy_cfg);
@@ -2627,7 +2742,10 @@ static int max1720x_probe(struct i2c_client *client,
 
 	max1720x_set_serial_number(chip);
 
+	chip->batt_health = POWER_SUPPLY_HEALTH_UNKNOWN;
+
 	INIT_WORK(&chip->cycle_count_work, max1720x_cycle_count_work);
+	INIT_DELAYED_WORK(&chip->temp_notify_work, max1720x_temp_notify_work);
 	INIT_DELAYED_WORK(&chip->init_work, max1720x_init_work);
 	schedule_delayed_work(&chip->init_work,
 			      msecs_to_jiffies(MAX1720X_DELAY_INIT_MS));
@@ -2650,6 +2768,7 @@ static int max1720x_remove(struct i2c_client *client)
 
 	max1720x_cleanup_history(chip);
 	cancel_delayed_work(&chip->init_work);
+	cancel_delayed_work(&chip->temp_notify_work);
 	iio_channel_release(chip->iio_ch);
 	if (chip->primary->irq)
 		free_irq(chip->primary->irq, chip);

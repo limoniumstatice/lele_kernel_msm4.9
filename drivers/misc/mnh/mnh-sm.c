@@ -117,24 +117,8 @@ HW_OUTx(HWIO_PCIE_SS_BASE_ADDR, PCIE_SS, reg, inst, val)
 
 #define MIN(a, b) (((a) < (b)) ? (a) : (b))
 
-/*
- * The maximum timeout value to stay awake.
- *
- * For most use cases, this will not be the only wakeup source,
- * because when Easel not used, application should have suspended Easel.
- *
- * For some rare background tasks, such as firmware update, or killing
- * Easel services in background, we want to stay awake for no more than
- * the timeout value, because at that time we may be the only wakeup
- * source.
- *
- * Driver automatically releases wakelock after timeout value, or
- * releases wakelock whenever Easel is not active.
- *
- * All power states change goes through mnh_sm_set_state(), so
- * it will be the central place to request to stay awake.
- */
-#define MNH_SM_WAKEUP_SOURCE_TIMEOUT_PRODUCTION (10000)
+/* Timeout (in milliseconds) for the device to hold wakelock in  */
+#define MNH_SM_WAKEUP_SOURCE_TIMEOUT_PRODUCTION (180000)
 
 enum fw_image_state {
 	FW_IMAGE_NONE = 0,
@@ -278,6 +262,12 @@ static enum mnh_boot_mode mnh_boot_mode = MNH_BOOT_MODE_PCIE;
 
 /* callback when easel enters and leaves the active state */
 static hotplug_cb_t mnh_hotplug_cb;
+
+/*
+ * Prints power_stats to buf. Returns number of bytes copied.
+ * Excludes mnh_sm_dev.lock.
+ */
+static ssize_t mnh_sm_print_power_stats(char *buf, size_t buffer_max_len);
 
 static int mnh_sm_get_val_from_buf(const char *buf, unsigned long *val)
 {
@@ -1538,6 +1528,13 @@ static ssize_t cpu_cg_store(struct device *dev,
 }
 static DEVICE_ATTR_WO(cpu_cg);
 
+static ssize_t power_stats_show(struct device *dev,
+				struct device_attribute *attr, char *buf)
+{
+	return mnh_sm_print_power_stats(buf, PAGE_SIZE);
+}
+static DEVICE_ATTR_RO(power_stats);
+
 #if IS_ENABLED(CONFIG_MNH_SIG)
 /* issue signature verification of the firmware in memory and print results */
 static ssize_t verify_fw_show(struct device *dev,
@@ -1585,6 +1582,7 @@ static struct attribute *mnh_sm_attrs[] = {
 	&dev_attr_mipi_config.attr,
 	&dev_attr_ddr_mbist.attr,
 	&dev_attr_cpu_cg.attr,
+	&dev_attr_power_stats.attr,
 #if IS_ENABLED(CONFIG_MNH_SIG)
 	&dev_attr_verify_fw.attr,
 #endif
@@ -1615,20 +1613,17 @@ static void mnh_sm_record_state_change(int prev_state, int new_state)
 	}
 }
 
-static ssize_t mnh_sm_dbgfs_read_powerstats(struct file *fp, char __user *ubuf,
-				size_t cnt, loff_t *ppos)
+static ssize_t mnh_sm_print_power_stats(char *buf, size_t buffer_max_len)
 {
-	const char * const states[MNH_STATE_MAX] = {"OFF", "ACTIVE", "SUSPEND"};
-	char *buf;
+	const char *const states[MNH_STATE_MAX] = { "OFF", "ACTIVE",
+						    "SUSPEND" };
 	int pos = 0;
-	int ret, i;
+	int i;
 	ktime_t last_entry;
 	ktime_t last_exit;
 	ktime_t adjusted_duration;
 	ktime_t partial_duration;
 
-
-#define BUFFER_MAX_LEN (4096)
 #define POWER_DEBUGFS_HEADER "Easel Subsystem Power Stats\n"
 #define PRINT_FORMAT  "%s\n"\
 				"\tCumulative count: %d\n"\
@@ -1636,15 +1631,9 @@ static ssize_t mnh_sm_dbgfs_read_powerstats(struct file *fp, char __user *ubuf,
 				"\tLast entry timestamp msec: %lld\n"\
 				"\tLast exit timestamp msec:  %lld\n"
 
-
-	buf = kzalloc(BUFFER_MAX_LEN, GFP_KERNEL);
-	if (!buf)
-		return -ENOMEM;
-
-	pos += scnprintf(buf + pos, BUFFER_MAX_LEN - pos, POWER_DEBUGFS_HEADER);
+	pos += scnprintf(buf + pos, buffer_max_len - pos, POWER_DEBUGFS_HEADER);
 
 	mutex_lock(&mnh_sm_dev->lock);
-
 	for (i = 0; i < MNH_STATE_MAX; i++) {
 		adjusted_duration = mnh_sm_dev->state_stats[i].duration;
 		last_entry = mnh_sm_dev->state_stats[i].last_entry;
@@ -1659,18 +1648,33 @@ static ssize_t mnh_sm_dbgfs_read_powerstats(struct file *fp, char __user *ubuf,
 				partial_duration);
 		}
 
-		pos += scnprintf(buf + pos, BUFFER_MAX_LEN - pos,
-			PRINT_FORMAT, states[i],
-			mnh_sm_dev->state_stats[i].counter,
-			ktime_to_ms(adjusted_duration),
-			ktime_to_ms(last_entry),
-			ktime_to_ms(last_exit));
+		pos += scnprintf(buf + pos, buffer_max_len - pos, PRINT_FORMAT,
+				 states[i], mnh_sm_dev->state_stats[i].counter,
+				 ktime_to_ms(adjusted_duration),
+				 ktime_to_ms(last_entry),
+				 ktime_to_ms(last_exit));
 	}
-
 	mutex_unlock(&mnh_sm_dev->lock);
-#undef BUFFER_MAX_LEN
+
 #undef POWER_DEBUGFS_HEADER
 #undef PRINT_FORMAT
+
+	return pos;
+}
+
+static ssize_t mnh_sm_dbgfs_read_powerstats(struct file *fp, char __user *ubuf,
+					    size_t cnt, loff_t *ppos)
+{
+	const size_t buffer_max_len = PAGE_SIZE;
+	char *buf;
+	int pos;
+	int ret;
+
+	buf = kzalloc(buffer_max_len, GFP_KERNEL);
+	if (!buf)
+		return -ENOMEM;
+
+	pos = mnh_sm_print_power_stats(buf, buffer_max_len);
 
 	ret = simple_read_from_buffer(ubuf, cnt, ppos, buf, pos);
 	kfree(buf);
@@ -2227,16 +2231,12 @@ static int mnh_sm_set_state_locked(int state)
 				 "%s: failed to transition to state %d (%d)\n",
 				 __func__, state, ret);
 
-			if (state == MNH_STATE_ACTIVE) {
-				mnh_sm_dev->powered = false;
-				reinit_completion(
-					&mnh_sm_dev->powered_complete);
-				mnh_sm_poweroff();
-				mnh_sm_enable_ready_irq(false);
-				mnh_sm_dev->state = MNH_STATE_OFF;
-			}
-
-			return ret;
+			/*
+			 * Always goes back to OFF state if a state change
+			 * failed, except when the target state is OFF.
+			 */
+			if (state != MNH_STATE_OFF)
+				return mnh_sm_set_state_locked(MNH_STATE_OFF);
 #if ALLOW_PARTIAL_ACTIVE
 		}
 #endif
@@ -2272,14 +2272,20 @@ int mnh_sm_set_state(int state)
 
 	prev_state = mnh_sm_dev->state;
 
-	/* on boot/resume, hold wakelock with timeout */
+	/*
+	 * Before cold boot or resume, hold a wakelock with timeout.
+	 */
 	if (state == MNH_STATE_ACTIVE)
 		pm_wakeup_event(mnh_sm_dev->dev,
 				MNH_SM_WAKEUP_SOURCE_TIMEOUT_PRODUCTION);
 
 	ret = mnh_sm_set_state_locked(state);
 
-	/* release wakelock immediately if ended up not active */
+	/*
+	 * If the state is no longer active, release the wakelock.
+	 * Note that "partial active" is considered active. It doesn't
+	 * matter whether ALLOW_PARTIAL_ACTIVE is configured or not.
+	 */
 	if (mnh_sm_dev->state != MNH_STATE_ACTIVE)
 		pm_relax(mnh_sm_dev->dev);
 

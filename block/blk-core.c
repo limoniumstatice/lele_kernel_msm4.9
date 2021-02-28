@@ -713,6 +713,9 @@ struct request_queue *blk_alloc_queue_node(gfp_t gfp_mask, int node_id)
 
 	kobject_init(&q->kobj, &blk_queue_ktype);
 
+#ifdef CONFIG_BLK_DEV_IO_TRACE
+	mutex_init(&q->blk_trace_mutex);
+#endif
 	mutex_init(&q->sysfs_lock);
 	spin_lock_init(&q->__queue_lock);
 
@@ -2133,6 +2136,9 @@ blk_qc_t submit_bio(struct bio *bio)
 	 */
 	if (workingset_read)
 		psi_memstall_enter(&pflags);
+
+	if (bio->bi_alloc_ts)
+		mm_event_record(BLK_READ_SUBMIT_BIO, bio->bi_alloc_ts);
 
 	ret = generic_make_request(bio);
 
